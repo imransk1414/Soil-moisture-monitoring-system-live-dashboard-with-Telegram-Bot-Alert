@@ -1,0 +1,268 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <WebServer.h>
+#include <UniversalTelegramBot.h>
+
+// ---------- USER SETTINGS ----------
+const char* WIFI_SSID     = " ";
+const char* WIFI_PASSWORD = " ";
+const char* BOT_TOKEN     = " ";   // from @BotFather 
+const char* CHAT_ID       = " ";     // from @myidbot
+
+#define SOIL_PIN 34
+
+int DRY_VALUE = 3200;   // raw reading in open air
+int WET_VALUE = 1400;   // raw reading in a glass of water
+
+int DRY_ALERT_PERCENT = 30;
+int OK_PERCENT        = 40;
+
+const unsigned long BOT_POLL_INTERVAL     = 1000;
+const unsigned long SENSOR_CHECK_INTERVAL = 10000;
+const unsigned long ALERT_COOLDOWN        = 30UL * 60UL * 1000UL;
+// -----------------------------------
+
+#define HIST 120   // readings kept in memory (120 x 10 s = 20 min)
+
+WiFiClientSecure secured_client;
+UniversalTelegramBot bot(BOT_TOKEN, secured_client);
+WebServer server(80);
+
+unsigned long lastBotPoll = 0, lastSensorCheck = 0, lastAlertTime = 0;
+bool isDry = false;
+
+uint8_t  histPct[HIST];
+uint16_t histRaw[HIST];
+int      histCount = 0, histHead = 0;   // histHead = next write slot
+int curPct = 0, curRaw = 0;
+
+// ---------- DASHBOARD PAGE (stored in flash) ----------
+const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Soil Moisture Dashboard</title>
+<style>
+:root{--bg:#f3f7f4;--card:#fff;--text:#15231b;--muted:#64746a;--line:#dde6e0;--accent:#2e9e5b;--dry:#d9534f;--wet:#2f7fd1;--track:#e4ece7}
+@media(prefers-color-scheme:dark){:root{--bg:#0e1612;--card:#16211b;--text:#e8f1ec;--muted:#93a69a;--line:#27352d;--accent:#46c27a;--dry:#ef6b66;--wet:#5aa2ee;--track:#243129}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:16px}
+.wrap{max-width:900px;margin:0 auto}
+header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+h1{font-size:1.3rem;margin:0}
+.status{display:flex;align-items:center;gap:8px;font-size:.9rem;color:var(--muted)}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--dry)}.dot.on{background:var(--accent)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:14px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.grid .card{margin-bottom:0}
+@media(max-width:640px){.grid{grid-template-columns:1fr}}
+h2{font-size:.8rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin:0 0 10px}
+.gauge{text-align:center}.gauge svg{width:100%;max-width:300px}
+.big{font-size:2.6rem;font-weight:700;line-height:1}
+.cond{font-size:1.05rem;font-weight:600;margin-top:6px}
+.banner{display:none;padding:12px 14px;border-radius:12px;margin-bottom:14px;font-weight:600;border:1px solid var(--dry);color:var(--dry)}
+.banner.show{display:block}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.stat{background:var(--bg);border-radius:10px;padding:10px}
+.stat span{display:block;font-size:.75rem;color:var(--muted)}.stat b{font-size:1.2rem}
+canvas{width:100%;height:240px;display:block}
+.log{list-style:none;margin:0;padding:0;max-height:180px;overflow-y:auto}
+.log li{padding:8px 0;border-bottom:1px solid var(--line);font-size:.9rem}
+small{color:var(--muted)}
+</style></head><body><div class="wrap">
+<header><h1>Soil Moisture Dashboard</h1>
+<div class="status"><span class="dot" id="dot"></span><span id="status">Connecting...</span></div></header>
+<div class="banner" id="banner">Soil is dry! Telegram alert sent. Please water the plant.</div>
+<div class="grid">
+<div class="card gauge"><h2>Current moisture</h2>
+<svg viewBox="0 0 200 120">
+<path d="M20 100 A80 80 0 0 1 180 100" fill="none" stroke="var(--track)" stroke-width="16" stroke-linecap="round"/>
+<path id="arc" d="M20 100 A80 80 0 0 1 180 100" fill="none" stroke="var(--accent)" stroke-width="16" stroke-linecap="round" stroke-dasharray="0 251.3"/>
+<text x="20" y="116" font-size="10" fill="var(--muted)" text-anchor="middle">0</text>
+<text x="180" y="116" font-size="10" fill="var(--muted)" text-anchor="middle">100</text></svg>
+<div class="big" id="pct">--%</div><div class="cond" id="cond">Waiting for data</div></div>
+<div class="card"><h2>Device &amp; statistics</h2><div class="stats">
+<div class="stat"><span>Raw ADC (0-4095)</span><b id="raw">--</b></div>
+<div class="stat"><span>Wi-Fi signal</span><b id="rssi">--</b></div>
+<div class="stat"><span>Average</span><b id="avg">--</b></div>
+<div class="stat"><span>Min / Max</span><b id="mm">--</b></div>
+<div class="stat"><span>Uptime</span><b id="up">--</b></div>
+<div class="stat"><span>Readings</span><b id="cnt">--</b></div></div></div></div>
+<div class="card" style="margin-top:14px"><h2>Moisture history (%)</h2><canvas id="chart"></canvas>
+<small>Red dashed = dry alert, green dashed = recovery. Updates every 5 s.</small></div>
+<div class="card"><h2>Alert log</h2><ul class="log" id="log"><li><small>No alerts yet</small></li></ul></div>
+</div>
+<script>
+const $=i=>document.getElementById(i);let D={};
+function cond(p){if(p<D.dry)return['Dry - needs water','var(--dry)'];if(p<60)return['Moist (good)','var(--accent)'];return['Wet','var(--wet)']}
+async function load(){try{const r=await fetch('/data');D=await r.json();render();$('status').textContent='Live';$('dot').className='dot on'}
+catch(e){$('status').textContent='Device offline';$('dot').className='dot'}}
+function render(){const p=D.p,n=p.length,last=p[n-1],c=cond(last);
+$('pct').textContent=last+'%';$('cond').textContent=c[0];$('cond').style.color=c[1];$('arc').style.stroke=c[1];
+$('arc').setAttribute('stroke-dasharray',(last/100*251.3)+' 251.3');
+$('raw').textContent=D.raw;$('rssi').textContent=D.rssi+' dBm';
+$('avg').textContent=Math.round(p.reduce((a,b)=>a+b,0)/n)+'%';
+$('mm').textContent=Math.min(...p)+'% / '+Math.max(...p)+'%';
+$('up').textContent=Math.floor(D.up/3600)+'h '+Math.floor(D.up%3600/60)+'m';$('cnt').textContent=n;
+$('banner').className='banner'+(last<D.dry?' show':'');
+let dry=false,h='';const now=Date.now();
+p.forEach((v,i)=>{const t=new Date(now-(n-1-i)*D.step*1000).toLocaleTimeString();
+if(v<D.dry&&!dry){dry=true;h='<li><b style="color:var(--dry)">DRY</b> '+v+'% at '+t+'</li>'+h}
+else if(dry&&v>D.ok){dry=false;h='<li><b style="color:var(--accent)">RECOVERED</b> '+v+'% at '+t+'</li>'+h}});
+$('log').innerHTML=h||'<li><small>No alerts in this history</small></li>';draw()}
+function draw(){const cv=$('chart'),dpr=devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;
+cv.width=W*dpr;cv.height=H*dpr;const g=cv.getContext('2d');g.scale(dpr,dpr);
+const p=D.p,n=p.length,css=getComputedStyle(document.documentElement),c=k=>css.getPropertyValue(k).trim();
+const L=36,R=10,T=10,B=24,x=i=>L+(n==1?0:i/(n-1))*(W-L-R),y=v=>T+(1-v/100)*(H-T-B);
+g.font='11px system-ui';g.fillStyle=c('--muted');g.strokeStyle=c('--line');g.lineWidth=1;
+for(let v=0;v<=100;v+=25){g.beginPath();g.moveTo(L,y(v));g.lineTo(W-R,y(v));g.stroke();g.fillText(v,6,y(v)+4)}
+[[D.dry,'--dry'],[D.ok,'--accent']].forEach(a=>{g.setLineDash([5,4]);g.strokeStyle=c(a[1]);g.beginPath();g.moveTo(L,y(a[0]));g.lineTo(W-R,y(a[0]));g.stroke()});
+g.setLineDash([]);g.beginPath();p.forEach((v,i)=>i?g.lineTo(x(i),y(v)):g.moveTo(x(i),y(v)));
+g.strokeStyle=c('--accent');g.lineWidth=2.5;g.stroke();g.lineTo(x(n-1),y(0));g.lineTo(x(0),y(0));g.closePath();
+g.globalAlpha=.12;g.fillStyle=c('--accent');g.fill();g.globalAlpha=1;
+g.fillStyle=c('--muted');const f=d=>d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),now=Date.now();
+g.textAlign='left';g.fillText(f(new Date(now-(n-1)*D.step*1000)),L,H-6);g.textAlign='right';g.fillText(f(new Date(now)),W-R,H-6)}
+addEventListener('resize',()=>D.p&&draw());load();setInterval(load,5000);
+</script></body></html>)rawliteral";
+
+// ---------- SENSOR ----------
+int readRaw() {
+  long sum = 0;
+  for (int i = 0; i < 20; i++) { sum += analogRead(SOIL_PIN); delay(5); }
+  return sum / 20;
+}
+
+int rawToPercent(int raw) {
+  return constrain(map(raw, DRY_VALUE, WET_VALUE, 0, 100), 0, 100);
+}
+
+String moistureLabel(int pct) {
+  if (pct < DRY_ALERT_PERCENT) return "Dry";
+  if (pct < 60) return "Moist (good)";
+  return "Wet";
+}
+
+String buildMoistureMessage() {
+  String msg = "Soil moisture: " + String(curPct) + "%\n";
+  msg += "Condition: " + moistureLabel(curPct) + "\n";
+  msg += "Raw ADC value: " + String(curRaw);
+  return msg;
+}
+
+void storeReading(int pct, int raw) {
+  histPct[histHead] = pct;
+  histRaw[histHead] = raw;
+  histHead = (histHead + 1) % HIST;
+  if (histCount < HIST) histCount++;
+}
+
+// ---------- WEB SERVER ----------
+void handleRoot() { server.send_P(200, "text/html", INDEX_HTML); }
+
+void handleData() {
+  String j;
+  j.reserve(900);
+  j = "{\"raw\":" + String(curRaw) + ",\"rssi\":" + String(WiFi.RSSI());
+  j += ",\"up\":" + String(millis() / 1000);
+  j += ",\"dry\":" + String(DRY_ALERT_PERCENT) + ",\"ok\":" + String(OK_PERCENT);
+  j += ",\"step\":" + String(SENSOR_CHECK_INTERVAL / 1000) + ",\"p\":[";
+  int start = (histHead - histCount + HIST) % HIST;   // oldest -> newest
+  for (int i = 0; i < histCount; i++) {
+    if (i) j += ",";
+    j += String(histPct[(start + i) % HIST]);
+  }
+  j += "]}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", j);
+}
+
+// ---------- TELEGRAM ----------
+void handleMessages(int numNew) {
+  for (int i = 0; i < numNew; i++) {
+    String chat_id = String(bot.messages[i].chat_id);
+    String text    = bot.messages[i].text;
+
+    if (chat_id != CHAT_ID) { bot.sendMessage(chat_id, "Unauthorized user.", ""); continue; }
+
+    if (text == "/start") {
+      String w = "Soil Moisture Bot\n\n/moisture - current soil moisture\n/status - moisture, Wi-Fi and uptime\n";
+      w += "Dashboard: http://" + WiFi.localIP().toString() + "/";
+      bot.sendMessage(chat_id, w, "");
+    } else if (text == "/moisture") {
+      bot.sendMessage(chat_id, buildMoistureMessage(), "");
+    } else if (text == "/status") {
+      String msg = buildMoistureMessage();
+      msg += "\nWi-Fi signal: " + String(WiFi.RSSI()) + " dBm";
+      msg += "\nUptime: " + String(millis() / 60000) + " min";
+      msg += "\nDashboard: http://" + WiFi.localIP().toString() + "/";
+      bot.sendMessage(chat_id, msg, "");
+    } else {
+      bot.sendMessage(chat_id, "Unknown command. Send /start to see options.", "");
+    }
+  }
+}
+
+void checkSoilAndAlert() {
+  curRaw = readRaw();
+  curPct = rawToPercent(curRaw);
+  storeReading(curPct, curRaw);
+  Serial.printf("Raw: %d  Moisture: %d%%\n", curRaw, curPct);
+
+  if (curPct < DRY_ALERT_PERCENT) {
+    if (!isDry || (millis() - lastAlertTime > ALERT_COOLDOWN)) {
+      bot.sendMessage(CHAT_ID,
+        "ALERT: Soil is dry! Moisture is " + String(curPct) + "%. Please water the plant.", "");
+      lastAlertTime = millis();
+    }
+    isDry = true;
+  } else if (isDry && curPct > OK_PERCENT) {
+    bot.sendMessage(CHAT_ID, "Soil moisture recovered to " + String(curPct) + "%. Thank you!", "");
+    isDry = false;
+  }
+}
+
+// ---------- SETUP / LOOP ----------
+void connectWiFi() {
+  Serial.printf("Connecting to %s", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nWi-Fi connected. Dashboard: http://" + WiFi.localIP().toString() + "/");
+}
+
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);
+  analogSetPinAttenuation(SOIL_PIN, ADC_11db);
+
+  connectWiFi();
+  secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+
+  checkSoilAndAlert();            // first reading so the dashboard has data immediately
+  lastSensorCheck = millis();
+
+  bot.sendMessage(CHAT_ID,
+    "Soil moisture monitor is online.\nDashboard: http://" + WiFi.localIP().toString() + "/", "");
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+
+  server.handleClient();
+
+  if (millis() - lastBotPoll > BOT_POLL_INTERVAL) {
+    int numNew = bot.getUpdates(bot.last_message_received + 1);
+    while (numNew) {
+      handleMessages(numNew);
+      numNew = bot.getUpdates(bot.last_message_received + 1);
+    }
+    lastBotPoll = millis();
+  }
+
+  if (millis() - lastSensorCheck > SENSOR_CHECK_INTERVAL) {
+    checkSoilAndAlert();
+    lastSensorCheck = millis();
+  }
+}
